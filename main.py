@@ -7,7 +7,8 @@ import json
 import wave
 import time
 import websockets
-ws_connect = websockets.connect
+import asyncio
+# ws_connect = websockets.connect
 from datetime import datetime
 
 from email.message import EmailMessage
@@ -17,6 +18,7 @@ from fastapi.responses import PlainTextResponse
 
 from openai import OpenAI
 from websocket import create_connection
+from websockets.client import connect as ws_connect
 # Load environment variables from .env
 load_dotenv()
 
@@ -29,6 +31,22 @@ VOICEMAIL_TO = os.getenv("VOICEMAIL_TO")
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+def fetch_call_details(call_sid: str):
+    """
+    Look up a call in Twilio's REST API so we can get From/To, etc.
+    Returns a dict on success, or None on failure.
+    """
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and call_sid):
+        return None
+
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{call_sid}.json"
+    try:
+        resp = requests.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print("Failed to fetch call details from Twilio:", e)
+        return None
 
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "verse")
@@ -36,7 +54,88 @@ OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "verse")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set in environment or .env file")
 
+QI_RECEPTIONIST_PROMPT = """
+You are the AI receptionist for QuantumInnovate (“QI”), an AI & automation consulting company.
+
+Your job is to handle inbound phone calls professionally, warmly, and efficiently.
+
+CORE IDENTITY
+- Introduce yourself on the first turn as “the QuantumInnovate virtual receptionist.”
+- You are an AI assistant, not a human. You speak naturally and conversationally, but never pretend to be human.
+- Your primary goal is to understand why the caller is reaching out and make it easy for a human on the QI team to follow up.
+
+CONVERSATION STYLE
+- Keep responses short and spoken-friendly: usually 1–3 sentences.
+- Ask one clear question at a time.
+- Use plain language. Avoid jargon unless the caller clearly understands it.
+- Be warm, calm, confident, and respectful. A bit of light, professional friendliness is good; don’t be cheesy.
+- Briefly acknowledge emotions (stress, confusion, excitement), then move the conversation forward.
+
+INFORMATION TO COLLECT (WHEN RELEVANT)
+- Caller name (and spelling if unclear).
+- Best callback number (confirm it out loud).
+- Email address (if they’re comfortable sharing).
+- Company or organization (if any).
+- Topic of the call (e.g., “AI automation for my business,” “website inquiry,” “billing question”).
+- How urgent the request is (low / normal / high).
+- Any deadlines or important context (dates, timeframes, launch windows, etc.).
+- Best time to reach them (time of day and time zone, if needed).
+
+BOUNDARIES & SAFETY
+- You are NOT allowed to give medical, legal, or tax advice. If asked, gently say you’re not qualified and that you’ll pass the question along to a human.
+- If the caller mentions anything life-threatening, self-harm, a crime in progress, fire, or serious medical emergency:
+  - Immediately tell them you cannot help with emergencies.
+  - Tell them to hang up and call 911 or their local emergency number right away.
+  - Do not try to handle the emergency yourself.
+- Never promise specific outcomes or timelines you can’t guarantee. Use phrases like “someone from the team will follow up” rather than naming exact times unless the caller has been told them beforehand.
+
+CALL FLOW GUIDELINES
+- Open with a concise greeting, your role, and an invitation to share why they’re calling.
+- Ask focused follow-up questions to clarify:
+  - What they want
+  - How soon they need it
+  - Whether they’ve worked with QI or AI tools before
+- If they ramble, gently steer them back: for example, “Got it, thank you for that context. To make sure we’re on the same page, what’s the main thing you’d like help with right now?”
+- Before ending, clearly summarize:
+  - What they’re looking for
+  - What information you’ve captured
+  - What happens next (“I’ll pass this along to Ernie and the team; someone will reach out to you.”)
+
+JSON SUMMARY MODE (for later automation)
+If you are explicitly asked to “summarize for the CRM” or “generate JSON summary”, respond ONLY with a single JSON object and no extra words.
+
+The JSON object MUST have exactly these keys:
+- name (string or null)
+- phone (string or null)
+- email (string or null)
+- company (string or null)
+- topic (string)
+- urgency ("low", "normal", or "high")
+- best_time_to_reach (string or null)
+- notes (string)
+
+When generating this summary JSON, do NOT include any commentary or explanation outside of the JSON itself.
+"""
+
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+QI_RECEPTIONIST_PROMPT = """
+You are the AI receptionist for QuantumInnovate (QI), an AI and automation consulting business.
+
+Your job is to read a voicemail transcript and give Ernie a concise, helpful summary of:
+- Who called (if they identify themselves)
+- What they want
+- How urgent it sounds
+- What Ernie should do next
+
+Tone:
+- Professional but warm and human.
+- No fluff. Be clear and direct.
+- Assume Ernie is busy; highlight only what actually matters.
+
+When you respond, DO NOT apologize, DO NOT say you are an AI model, and DO NOT explain your reasoning.
+Just give a short summary and recommended next steps in 3–6 sentences max.
+"""
 
 app = FastAPI()
 
@@ -150,9 +249,12 @@ def transcribe_recording(recording_url: str) -> str:
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
     """
-    Main call handler. Plays a greeting and records a voicemail.
+    Main call handler for PRODUCTION QI line.
+
+    Plays a greeting and records a voicemail.
     When the recording is complete, Twilio will POST to /recording-complete.
     """
+
     # IMPORTANT: update this base URL whenever ngrok URL changes
     ngrok_base = os.getenv("NGROK_BASE_URL", "").rstrip("/")
     if not ngrok_base:
@@ -165,8 +267,8 @@ async def incoming_call(request: Request):
 <Response>
     <Say voice="alice">
         Thank you for calling QuantumInnovate.
-        This line is currently in development as our new A I receptionist.
-        Please leave a message after the tone, and we will get back to you.
+        Our AI receptionist is currently in training.
+        Please leave your name, number, and a brief message after the tone.
     </Say>
     <Record maxLength="120" playBeep="true"
             recordingStatusCallback="{recording_callback_url}"
@@ -174,6 +276,96 @@ async def incoming_call(request: Request):
 </Response>
 """
     return PlainTextResponse(content=twiml, media_type="application/xml")
+
+from typing import Optional
+
+
+def summarize_voicemail(transcript_text: str) -> str:
+    """
+    Use an OpenAI text model to summarize the voicemail transcript
+    into something you can skim quickly.
+    """
+    if (
+        not transcript_text
+        or transcript_text.startswith("(Transcription failed")
+    ):
+        return "Summary unavailable (missing or failed transcript)."
+
+    system_msg = (
+        "You are an assistant for QuantumInnovate (QI), an AI and automation consulting firm. "
+        "You receive voicemail transcripts from prospects and clients. "
+        "Your job is to summarize the voicemail for the business owner."
+    )
+
+    user_msg = f"""
+Voicemail transcript:
+
+\"\"\"{transcript_text}\"\"\"
+
+Produce a concise summary with this structure:
+
+- Caller name (if present, otherwise 'Unknown')
+- Organization (if mentioned)
+- Reason for calling (1–2 sentences)
+- Priority: one of [Low, Normal, High, Urgent]
+- Suggested next action for Ernie (1 sentence)
+"""
+
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.3,
+            max_tokens=220,
+        )
+        summary = completion.choices[0].message.content.strip()
+        return summary or "Summary generation returned empty text."
+    except Exception as e:
+        print("Error while summarizing voicemail:", e)
+        return f"Summary failed: {e}"
+
+
+def generate_qi_receptionist_notes(transcript_text: str, meta: dict) -> str:
+    """
+    Use OpenAI Responses API + the QI receptionist persona
+    to produce a short, helpful summary of the voicemail.
+    """
+    if not transcript_text:
+        return ""
+
+    # Build a single prompt string that includes transcript + key metadata
+    prompt = f"""
+Voicemail transcript:
+\"\"\" 
+{transcript_text}
+\"\"\"
+
+Metadata:
+- From: {meta.get("from") or "Unknown"}
+- To: {meta.get("to") or "Unknown"}
+- Duration (seconds): {meta.get("duration_seconds") or "Unknown"}
+- Call SID: {meta.get("call_sid") or "Unknown"}
+- Recording URL: {meta.get("recording_url") or "Unknown"}
+
+Using the instructions you were given as the QI receptionist, 
+summarize this voicemail and suggest what Ernie should do next.
+"""
+
+    try:
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            instructions=QI_RECEPTIONIST_PROMPT,
+            input=prompt,
+        )
+        # New OpenAI SDK gives you output_text convenience:
+        notes = (response.output_text or "").strip()
+        return notes
+    except Exception as e:
+        print("Error generating QI receptionist notes:", e)
+        return ""
 
 
 @app.post("/recording-complete")
@@ -187,10 +379,14 @@ async def recording_complete(request: Request):
     """
     form = await request.form()
     recording_url = form.get("RecordingUrl")
-    from_number = form.get("From")
-    to_number = form.get("To")
     duration = form.get("RecordingDuration")
     call_sid = form.get("CallSid")
+
+    # Try to enrich with Twilio REST API (for real from/to)
+    twilio_call = fetch_call_details(call_sid) if call_sid else None
+
+    from_number = form.get("From") or (twilio_call.get("from") if twilio_call else None)
+    to_number = form.get("To") or (twilio_call.get("to") if twilio_call else None)
 
     if not recording_url:
         raise HTTPException(status_code=400, detail="Missing RecordingUrl")
@@ -203,8 +399,27 @@ async def recording_complete(request: Request):
     except Exception as e:
         print("Error during transcription:", e)
         transcript_text = f"(Transcription failed: {e})"
+    ai_summary = summarize_voicemail(transcript_text)
 
     subject = f"New QI Voicemail from {from_number or 'Unknown'}"
+
+    import json  # ensure this is at the top of the file
+
+    # Build structured metadata for JSON
+    metadata = {
+        "from": from_number,
+        "to": to_number,
+        "duration_seconds": duration,
+        "call_sid": call_sid,
+        "recording_url": recording_url,
+        }
+    # Generate AI receptionist notes
+    ai_notes = generate_qi_receptionist_notes(transcript_text, metadata)
+
+    # Make pretty JSON
+    metadata_json = json.dumps(metadata, indent=4)
+
+    # Build email body including JSON block
     body = (
         f"You have a new voicemail.\n\n"
         f"From: {from_number}\n"
@@ -212,8 +427,15 @@ async def recording_complete(request: Request):
         f"Call SID: {call_sid}\n"
         f"Duration: {duration} seconds\n"
         f"Recording URL (Twilio): {recording_url}\n\n"
-        f"Transcript:\n{transcript_text}\n"
-    )
+        f"Transcript:\n{transcript_text}\n\n"
+        "----- JSON METADATA -----\n"
+        f"{metadata_json}\n"
+        )
+    if ai_notes:
+        body += (
+            "\n----- AI RECEPTIONIST NOTES -----\n"
+            f"{ai_notes}\n"
+        )
 
     send_email(subject, body)
 
@@ -275,6 +497,19 @@ async def test_realtime_from_file():
         "file": path,
         "transcript": transcript,
     }
+
+@app.post("/test-qi-receptionist")
+async def test_qi_receptionist():
+    """
+    HTTP endpoint to trigger a QI receptionist Realtime test.
+
+    Call this with:
+        curl -X POST http://127.0.0.1:8000/test-qi-receptionist
+
+    It returns the AI's reply as JSON and also prints it to the server logs.
+    """
+    reply = await run_qi_receptionist_test()
+    return {"reply": reply}
 
 @app.post("/incoming-stream-test")
 async def incoming_stream_test(request: Request):
@@ -419,6 +654,96 @@ async def transcribe_ulaw_with_realtime(path: str) -> str:
     print("Final transcript from Realtime:", transcript or "(empty)")
     return transcript or "(no transcript received)"
 
+async def run_qi_receptionist_test() -> str:
+    """
+    Connects to OpenAI Realtime, applies the QI receptionist persona,
+    sends a fake 'caller message', and returns the AI's reply text.
+    This does NOT involve Twilio at all; it's a pure Realtime test.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set; cannot run QI receptionist test.")
+
+    url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "OpenAI-Beta": "realtime=v1",
+    }
+
+    print("Connecting to OpenAI Realtime for QI receptionist test at:", url)
+
+    final_text_chunks: list[str] = []
+
+    async with websockets.connect(url, extra_headers=headers) as ws:
+        print("Connected to OpenAI Realtime (QI receptionist test).")
+
+        # 1) Configure the session with our receptionist persona
+        session_update = {
+            "type": "session.update",
+            "session": {
+                "instructions": QI_RECEPTIONIST_PROMPT,
+                "modalities": ["text"],  # text only for this test
+                "turn_detection": None,  # we are sending a single text "turn"
+                "max_response_output_tokens": 256,
+            },
+        }
+        await ws.send(json.dumps(session_update))
+        print("Sent session.update with QI receptionist persona.")
+
+        # 2) Send a fake "caller" message as input
+        test_caller_message = (
+            "Hi, this is Ernie. I'm calling as a new potential client. "
+            "Give me a quick friendly greeting, confirm my name, "
+            "and ask one clear question about what I need help with."
+        )
+
+        response_create = {
+            "type": "response.create",
+            "response": {
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": test_caller_message,
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+        await ws.send(json.dumps(response_create))
+        print("Sent response.create with test caller message.")
+
+        # 3) Read events until we get the full reply
+        while True:
+            message_text = await ws.recv()
+            event = json.loads(message_text)
+            rt_type = event.get("type")
+
+            if rt_type == "response.text.delta":
+                # Incremental text chunks from the assistant
+                delta_text = event.get("delta", "")
+                final_text_chunks.append(delta_text)
+
+            elif rt_type == "response.text.done":
+                # End of the text for this response
+                print("OpenAI Realtime response.text.done received.")
+                break
+
+            elif rt_type == "error":
+                print("Error from OpenAI Realtime:", event)
+                break
+
+            # Other events (response.created, output_item.added, etc.) are ignored for now
+
+    final_text = "".join(final_text_chunks).strip()
+    print("AI receptionist test reply:", final_text or "(empty)")
+
+    return final_text or "(no text reply received)"
+
 def clean_ai_text(s: str) -> str:
     """
     Strip any leading JSON-ish metadata the model might prepend,
@@ -440,75 +765,210 @@ def clean_ai_text(s: str) -> str:
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     """
-    Twilio <Stream> handler.
+    Live Twilio <-> OpenAI Realtime bridge.
 
-    - Receives JSON text frames from Twilio's Media Streams
-    - Buffers μ-law audio from "media" events
-    - On "stop", writes the raw audio to recordings/<streamSid>.ulaw
+    - Receives Twilio media stream events (μ-law G.711 audio).
+    - Streams caller audio into OpenAI Realtime.
+    - Streams Verse audio from OpenAI back to Twilio in real-time.
+    - Still saves the entire call to recordings/<streamSid>.ulaw for debugging.
     """
-    await websocket.accept()
     print("Twilio is connecting to /media-stream...")
+    await websocket.accept()
 
-    stream_sid = None
+    # For debugging / archive
     audio_buffer = bytearray()
+    stream_sid: str | None = None
+    audio_sent_to_openai = False
+
+    # OpenAI Realtime WebSocket URL + headers
+    url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "OpenAI-Beta": "realtime=v1",
+    }
 
     try:
-        while True:
-            # Twilio sends JSON text frames
-            message_text = await websocket.receive_text()
-            data = json.loads(message_text)
-            event_type = data.get("event")
+        async with ws_connect(url, extra_headers=headers) as rt_ws:
+            print("Connected to OpenAI Realtime for LIVE QI receptionist.")
 
-            if event_type == "connected":
-                print("Media stream connected:", data)
+            # Configure the Realtime session for:
+            # - audio in (g711_ulaw from Twilio)
+            # - audio out (g711_ulaw back to Twilio)
+            # - QI receptionist persona
+            session_update = {
+                "type": "session.update",
+                "session": {
+                    "modalities": ["audio", "text"],
+                    "voice": "verse",
+                    "instructions": QI_RECEPTIONIST_PROMPT,
+                    "input_audio_format": "g711_ulaw",
+                    "output_audio_format": "g711_ulaw",
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "silence_duration_ms": 600,
+                        "prefix_padding_ms": 300,
+                        "create_response": True,
+                        "interrupt_response": True,
+                    },
+                },
+            }
 
-            elif event_type == "start":
-                stream_sid = data.get("start", {}).get("streamSid")
-                print(f"Media stream started. streamSid={stream_sid}")
+            await rt_ws.send(json.dumps(session_update))
+            print("Sent session.update for live call.")
 
-            elif event_type == "media":
-                media = data.get("media", {})
-                payload_b64 = media.get("payload")
-                if payload_b64:
-                    # Base64 → μ-law bytes
-                    ulaw_bytes = base64.b64decode(payload_b64)
-                    audio_buffer.extend(ulaw_bytes)
+            # Send an initial greeting so the caller hears Verse right away
+            initial_greeting = {
+                "type": "response.create",
+                "response": {
+                    "instructions": (
+                        "Greet the caller warmly as the QuantumInnovate virtual receptionist. "
+                        "Say your name is Verse, briefly state what QuantumInnovate does in plain English, "
+                        "and then ask how you can help today."
+                    )
+                },
+            }
 
-            elif event_type == "stop":
-                print("Media stream stop event received:", data)
-                # End of this call's stream
-                break
+            await rt_ws.send(json.dumps(initial_greeting))
+            print("Sent initial greeting request to OpenAI.")
 
-            else:
-                # Other Twilio events we don't care about right now
-                pass
+            async def forward_twilio_to_openai():
+                nonlocal stream_sid
+                try:
+                    while True:
+                        message_text = await websocket.receive_text()
+                        data = json.loads(message_text)
+                        event_type = data.get("event")
 
-    except WebSocketDisconnect:
-        print("Twilio disconnected from /media-stream")
+                        if event_type == "connected":
+                            print("Media stream connected:", data)
 
-    # After the stream ends, persist audio to disk
-    if not stream_sid:
-        stream_sid = "unknown"
+                        elif event_type == "start":
+                            stream_sid = data.get("start", {}).get("streamSid")
+                            print(f"Media stream started. streamSid={stream_sid}")
 
-    os.makedirs("recordings", exist_ok=True)
-    file_path = os.path.join("recordings", f"{stream_sid}.ulaw")
-    with open(file_path, "wb") as f:
-        f.write(audio_buffer)
+                        elif event_type == "media":
+                            media = data.get("media", {})
+                            payload_b64 = media.get("payload")
+                            if payload_b64:
+                                # Save to local buffer for debugging/recording
+                                try:
+                                    ulaw_bytes = base64.b64decode(payload_b64)
+                                    audio_buffer.extend(ulaw_bytes)
+                                except Exception as e:
+                                    print("Failed to decode Twilio payload:", e)
 
-    print(f"Saved media stream raw μ-law audio to {file_path}")
+                                # Forward μ-law audio chunk to OpenAI
+                                try:
+                                    await rt_ws.send(
+                                        json.dumps(
+                                            {
+                                                "type": "input_audio_buffer.append",
+                                                "audio": payload_b64,
+                                            }
+                                        )
+                                    )
+                                    # Mark that we've actually sent audio
+                                    nonlocal audio_sent_to_openai
+                                    audio_sent_to_openai = True
+                                except Exception as e:
+                                    print("Error sending audio to OpenAI:", e)
 
-    # NEW: Transcribe the streamed call with OpenAI Realtime and email it
-    try:
-        transcript = await transcribe_ulaw_with_realtime(file_path)
-        print("AI transcript:", transcript)
+                        elif event_type == "stop":
+                            print("Media stream stop event received:", data)
 
-        subject = f"New QI streamed call ({stream_sid})"
-        body = (
-            f"Stream SID: {stream_sid}\n"
-            f"File: {file_path}\n\n"
-            f"Transcript:\n{transcript}\n"
-        )
-        send_email(subject, body)
+                        # Only commit if we actually sent audio; otherwise Realtime complains
+                        if audio_sent_to_openai:
+                            try:
+                                await rt_ws.send(
+                                     json.dumps(
+                                         {
+                                             "type": "input_audio_buffer.commit",
+                                         }
+                                     )
+                                 )
+                            except Exception as e:
+                                 print("Error committing audio buffer to OpenAI:", e)
+                        else:
+                            print("No audio was sent to OpenAI; skipping input_audio_buffer.commit.")
 
-    except Exception as e:
-        print("Error transcribing streamed call:", e)
+                        break
+
+                except WebSocketDisconnect:
+                    print("Twilio disconnected from /media-stream")
+                except Exception as e:
+                    print("Error in forward_twilio_to_openai:", e)
+
+            async def forward_openai_to_twilio():
+                try:
+                    async for raw in rt_ws:
+                        try:
+                            rt_event = json.loads(raw)
+                        except Exception:
+                            print("Non-JSON event from OpenAI:", raw)
+                            continue
+
+                        rt_type = rt_event.get("type")
+
+                        # Stream Verse audio chunks back to Twilio
+                        if rt_type == "response.audio.delta":
+                            delta_b64 = rt_event.get("delta")
+                            if delta_b64 and stream_sid:
+                                twilio_msg = {
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {
+                                        "payload": delta_b64,
+                                    },
+                                }
+                                try:
+                                    await websocket.send_text(json.dumps(twilio_msg))
+                                except Exception as e:
+                                    print("Error sending media back to Twilio:", e)
+
+                        elif rt_type == "response.audio.done":
+                            # One spoken reply finished - Twilio just keeps playing
+                            pass
+
+                        elif rt_type == "error":
+                            print("Error from OpenAI Realtime (live):", rt_event)
+
+                        # Optional: log text for debugging
+                        elif rt_type == "response.text.delta":
+                            delta_text = rt_event.get("delta", "")
+                            if delta_text:
+                                print("AI (text delta):", delta_text, flush=True)
+
+                        elif rt_type == "response.text.done":
+                            full_text = ""
+                            # Some SDKs deliver the final text here; our logging above
+                            # already prints deltas, so this is just a hook.
+                            print("AI finished a text response.")
+
+                except Exception as e:
+                    print("Error in forward_openai_to_twilio:", e)
+
+            # Run both directions concurrently
+            await asyncio.gather(
+                forward_twilio_to_openai(),
+                forward_openai_to_twilio(),
+            )
+
+    finally:
+        # Save the raw μ-law audio to a file for debugging
+        if audio_buffer and stream_sid:
+            try:
+                os.makedirs("recordings", exist_ok=True)
+                path = os.path.join("recordings", f"{stream_sid}.ulaw")
+                with open(path, "wb") as f:
+                    f.write(audio_buffer)
+                print(f"Saved media stream raw μ-law audio to {path}")
+            except Exception as e:
+                print("Failed to save media stream audio:", e)
+
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+        print("Media stream closed.")
