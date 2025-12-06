@@ -5,6 +5,7 @@ import smtplib
 import base64
 import json
 import wave
+import time
 import websockets
 ws_connect = websockets.connect
 from datetime import datetime
@@ -28,6 +29,9 @@ VOICEMAIL_TO = os.getenv("VOICEMAIL_TO")
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
+OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "verse")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set in environment or .env file")
@@ -415,66 +419,96 @@ async def transcribe_ulaw_with_realtime(path: str) -> str:
     print("Final transcript from Realtime:", transcript or "(empty)")
     return transcript or "(no transcript received)"
 
+def clean_ai_text(s: str) -> str:
+    """
+    Strip any leading JSON-ish metadata the model might prepend,
+    e.g. '{"name": "Ernie"}Hello there...' -> 'Hello there...'
+    """
+    if not s:
+        return s
+
+    s = s.strip()
+
+    # If it starts with '{' and contains '}', treat that as a metadata block
+    if s.startswith("{"):
+        close_idx = s.find("}")
+        if close_idx != -1 and close_idx + 1 < len(s):
+            return s[close_idx + 1 :].lstrip()
+
+    return s
+
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     """
-    WebSocket endpoint that Twilio Media Streams connects to.
-    We:
-      - accept the connection
-      - collect 'media' event payloads (base64 μ-law audio)
-      - on 'stop' or disconnect, convert to WAV and save to disk
-    """
-    print("Twilio is connecting to /media-stream...")
-    await websocket.accept()
+    Twilio <Stream> handler.
 
-    audio_buffer = bytearray()
+    - Receives JSON text frames from Twilio's Media Streams
+    - Buffers μ-law audio from "media" events
+    - On "stop", writes the raw audio to recordings/<streamSid>.ulaw
+    """
+    await websocket.accept()
+    print("Twilio is connecting to /media-stream...")
+
     stream_sid = None
+    audio_buffer = bytearray()
 
     try:
         while True:
+            # Twilio sends JSON text frames
             message_text = await websocket.receive_text()
             data = json.loads(message_text)
             event_type = data.get("event")
 
-            # Log start/stop events for debugging
             if event_type == "connected":
                 print("Media stream connected:", data)
+
             elif event_type == "start":
                 stream_sid = data.get("start", {}).get("streamSid")
                 print(f"Media stream started. streamSid={stream_sid}")
+
             elif event_type == "media":
                 media = data.get("media", {})
                 payload_b64 = media.get("payload")
                 if payload_b64:
-                    # Decode base64 μ-law audio and append
+                    # Base64 → μ-law bytes
                     ulaw_bytes = base64.b64decode(payload_b64)
                     audio_buffer.extend(ulaw_bytes)
+
             elif event_type == "stop":
                 print("Media stream stop event received:", data)
+                # End of this call's stream
                 break
+
+            else:
+                # Other Twilio events we don't care about right now
+                pass
 
     except WebSocketDisconnect:
         print("Twilio disconnected from /media-stream")
 
-    # After the loop, if we have audio, write it to a .ulaw file
-    if audio_buffer:
-        os.makedirs("recordings", exist_ok=True)
+    # After the stream ends, persist audio to disk
+    if not stream_sid:
+        stream_sid = "unknown"
 
-        if not stream_sid:
-            # Fallback filename if we didn't get a streamSid
-            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            stream_sid = f"no_sid_{timestamp}"
+    os.makedirs("recordings", exist_ok=True)
+    file_path = os.path.join("recordings", f"{stream_sid}.ulaw")
+    with open(file_path, "wb") as f:
+        f.write(audio_buffer)
 
-        ulaw_path = os.path.join("recordings", f"{stream_sid}.ulaw")
+    print(f"Saved media stream raw μ-law audio to {file_path}")
 
-        try:
-            with open(ulaw_path, "wb") as f:
-                f.write(bytes(audio_buffer))
+    # NEW: Transcribe the streamed call with OpenAI Realtime and email it
+    try:
+        transcript = await transcribe_ulaw_with_realtime(file_path)
+        print("AI transcript:", transcript)
 
-            print(f"Saved media stream raw μ-law audio to {ulaw_path}")
-            print("You can convert/play this with ffmpeg, e.g.:")
-            print(f"  ffmpeg -f mulaw -ar 8000 -ac 1 -i {ulaw_path} {stream_sid}.wav")
-        except Exception as e:
-            print(f"Failed to write μ-law file: {e}")
-    else:
-        print("No audio received in media stream; nothing to save.")
+        subject = f"New QI streamed call ({stream_sid})"
+        body = (
+            f"Stream SID: {stream_sid}\n"
+            f"File: {file_path}\n\n"
+            f"Transcript:\n{transcript}\n"
+        )
+        send_email(subject, body)
+
+    except Exception as e:
+        print("Error transcribing streamed call:", e)
